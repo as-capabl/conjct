@@ -265,6 +265,12 @@ onType_int _ o =
     checkType o "integer"
     return $ return (ConT ''Int)
 
+onType_number :: OnType
+onType_number _ o =
+  do
+    checkType o "number"
+    return $ return (ConT ''Double)
+
 onType_text :: OnType
 onType_text _ o =
   do
@@ -328,6 +334,7 @@ onTypeDefaultList = [
     onType_array,
     onType_ref,
     onType_int,
+    onType_number,
     onType_text,
     onType_bool,
     onType_dict,
