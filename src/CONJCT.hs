@@ -6,7 +6,7 @@
 {-# LANGUAGE RecordWildCards #-}
 
 module
-    Conjct
+    CONJCT
 where
 
 import Data.Maybe (fromMaybe, catMaybes)
@@ -29,7 +29,7 @@ import qualified Data.Vector.Generic as V
 import qualified Data.HashMap.Strict as HM
 import System.FilePath
 
-import Conjct.Util
+import CONJCT.Util
 
 type NameMap = Map Text Name
 type JSONValue = J.Value

@@ -1,5 +1,5 @@
 module
-    Conjct.Util
+    CONJCT.Util
       (
         parseNonZeroVector,  
       )
