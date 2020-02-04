@@ -67,15 +67,16 @@ data FieldInfo = FieldInfo {
     fldToJSON :: Name -> Exp
   }
 
-type OnType = SchemaSetting -> J.Object -> Maybe (SCQ Type)
-type OnModule = SchemaSetting -> SchemaFile -> Maybe (Name, SCQ ())
-type OnMember = SchemaSetting -> SchemaFile -> MemberName -> IsRequired -> J.Object -> Maybe (SCQ FieldInfo)
+type OnType ud = SchemaSetting ud -> J.Object -> Maybe (SCQ Type)
+type OnModule ud = SchemaSetting ud -> SchemaFile -> Maybe (Name, SCQ ())
+type OnMember ud = SchemaSetting ud -> SchemaFile -> MemberName -> IsRequired -> J.Object -> Maybe (SCQ FieldInfo)
 
-data SchemaSetting = SchemaSetting {
+data SchemaSetting ud = SchemaSetting {
     schemaBaseDir :: Text,
-    onType :: [OnType],
-    onModule :: [OnModule],
-    onMember :: [OnMember]
+    onType :: [OnType ud],
+    onModule :: [OnModule ud],
+    onMember :: [OnMember ud],
+    userData :: ud
   }
 
 schemaSuffix :: Text
@@ -116,7 +117,7 @@ memberNameDefault fileName k =
         [] -> Nothing
         x:xs -> return $ mconcat (appToHead T.toLower x : (appToHead T.toUpper <$> xs))
 
-onModuleDefault :: OnModule
+onModuleDefault :: OnModule ud
 onModuleDefault stg scFile =
   do
     nmText <- typeNameDefault scFile
@@ -204,7 +205,7 @@ mkFieldInfo nMem t k op = FieldInfo {..}
     fldToJSON = undefined
 
 -- | For non-zero array members, omited value can be represented by empty array
-onMember_nonzeroArray :: OnMember
+onMember_nonzeroArray :: OnMember ud
 onMember_nonzeroArray stg scFile k req o =
   do
     guard $ not req
@@ -218,7 +219,7 @@ onMember_nonzeroArray stg scFile k req o =
         nMem <- maybe (fail "memberName") return $ memberNameDefault scFile k
         return $ mkFieldInfo nMem t k 'parseNonZeroVector
 
-onMember_opt :: OnMember
+onMember_opt :: OnMember ud
 onMember_opt stg _ _ True o = Nothing
 onMember_opt stg scFile k False o = Just $
   do
@@ -226,19 +227,19 @@ onMember_opt stg scFile k False o = Just $
     nMem <- maybe (fail "memberName") return $ memberNameDefault scFile k
     return $ mkFieldInfo nMem (AppT (ConT ''Maybe) t) k '(J..:?)
     
-onMember_default :: OnMember
+onMember_default :: OnMember ud
 onMember_default stg scFile k _ o = Just $
   do
     t <- doOnType stg o
     nMem <- maybe (fail "memberName") return $ memberNameDefault scFile k
     return $ mkFieldInfo nMem t k '(J..:)
 
-doOnMember :: SchemaSetting -> SchemaFile -> MemberName -> IsRequired -> J.Object -> SCQ FieldInfo
+doOnMember :: SchemaSetting ud -> SchemaFile -> MemberName -> IsRequired -> J.Object -> SCQ FieldInfo
 doOnMember stg s n req o =
     either id id $ findTop "onMember" $
         onMember stg <*> pure stg <*> pure s <*> pure n <*> pure req <*> pure o
 
-doOnType :: SchemaSetting -> J.Object -> SCQ Type
+doOnType :: SchemaSetting ud -> J.Object -> SCQ Type
 doOnType stg o = either id id $ findTop "onType" $ onType stg <*> pure stg <*> pure o
 
 checkType :: J.Object -> Text -> Maybe ()
@@ -248,7 +249,7 @@ checkType o tCheck =
     guard $ t == tCheck
 
 
-onType_array :: OnType
+onType_array :: OnType ud
 onType_array stg o =
   do
     checkType o "array"
@@ -259,31 +260,31 @@ onType_array stg o =
         t <- doOnType stg oItem
         return $ AppT (ConT ''Vector) t
 
-onType_int :: OnType
+onType_int :: OnType ud
 onType_int _ o =
   do
     checkType o "integer"
     return $ return (ConT ''Int)
 
-onType_number :: OnType
+onType_number :: OnType ud
 onType_number _ o =
   do
     checkType o "number"
     return $ return (ConT ''Double)
 
-onType_text :: OnType
+onType_text :: OnType ud
 onType_text _ o =
   do
     checkType o "string"
     return $ return (ConT ''Text)
 
-onType_bool :: OnType
+onType_bool :: OnType ud
 onType_bool _ o =
   do
     checkType o "boolean"
     return $ return (ConT ''Bool)
 
-onType_dict :: OnType
+onType_dict :: OnType ud
 onType_dict stg o =
   do
     checkType o "object"
@@ -295,7 +296,7 @@ onType_dict stg o =
         return $ ConT ''HashMap `AppT` ConT ''Text `AppT` t
 
 
-onType_ref :: OnType
+onType_ref :: OnType ud
 onType_ref stg o =
   do
     s <- resultM . J.fromJSON =<< HM.lookup "$ref" o
@@ -305,7 +306,7 @@ onType_ref stg o =
         n <- doOnModule stg s
         return $ ConT n
 
-onType_allOf :: OnType
+onType_allOf :: OnType ud
 onType_allOf stg o =
   do
     x : _ <- resultM . J.fromJSON =<< HM.lookup "allOf" o
@@ -317,19 +318,20 @@ onType_allOf stg o =
     
 
 
-onType_fallback :: OnType
+onType_fallback :: OnType ud
 onType_fallback _ _ = Just $ return (ConT ''JSONValue)
     
 
-defaultSchemaSetting :: Text -> SchemaSetting
+defaultSchemaSetting :: Text -> SchemaSetting ()
 defaultSchemaSetting path = SchemaSetting {
     schemaBaseDir = path,
     onType = onTypeDefaultList,
     onModule = [onModuleDefault],
-    onMember = onMemberDefaultList
+    onMember = onMemberDefaultList,
+    userData = ()
   }
 
-onTypeDefaultList :: [OnType]
+onTypeDefaultList :: [OnType ud]
 onTypeDefaultList = [
     onType_array,
     onType_ref,
@@ -342,14 +344,14 @@ onTypeDefaultList = [
     onType_fallback
   ]
 
-onMemberDefaultList :: [OnMember]
+onMemberDefaultList :: [OnMember ud]
 onMemberDefaultList = [
     onMember_nonzeroArray,
     onMember_opt,
     onMember_default
   ]
 
-doOnModule :: SchemaSetting -> SchemaFile -> SCQ Name
+doOnModule :: SchemaSetting ud -> SchemaFile -> SCQ Name
 doOnModule stg s =
   do
     iom <- snd <$> ask
@@ -369,7 +371,7 @@ doOnModule stg s =
         action
         return n :: SCQ Name
 
-fromSchema :: SchemaSetting -> Text -> DecsQ
+fromSchema :: SchemaSetting ud -> Text -> DecsQ
 fromSchema stg scFile =
   do
     d <- liftIO $ newIORef $ Endo id
