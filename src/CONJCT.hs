@@ -67,17 +67,26 @@ data FieldInfo = FieldInfo {
     fldToJSON :: Name -> Exp
   }
 
-type OnType ud = SchemaSetting ud -> J.Object -> Maybe (SCQ Type)
-type OnModule ud = SchemaSetting ud -> SchemaFile -> Maybe (Name, SCQ ())
-type OnMember ud = SchemaSetting ud -> SchemaFile -> MemberName -> IsRequired -> J.Object -> Maybe (SCQ FieldInfo)
+type OnType ud = ud -> J.Object -> Maybe (SCQ Type)
+type OnModule ud = ud -> SchemaFile -> Maybe (Name, SCQ ())
+type OnMember ud = ud -> SchemaFile -> MemberName -> IsRequired -> J.Object -> Maybe (SCQ FieldInfo)
 
 data SchemaSetting ud = SchemaSetting {
     schemaBaseDir :: Text,
     onType :: [OnType ud],
     onModule :: [OnModule ud],
-    onMember :: [OnMember ud],
-    userData :: ud
+    onMember :: [OnMember ud]
   }
+
+class HasSchemaSetting a
+  where
+    getSchemaSetting :: a -> SchemaSetting a
+
+newtype SimpleSchemaSetting = SimpleSchemaSetting (SchemaSetting SimpleSchemaSetting)
+
+instance HasSchemaSetting SimpleSchemaSetting
+  where
+    getSchemaSetting (SimpleSchemaSetting x) = x
 
 schemaSuffix :: Text
 schemaSuffix = ".schema.json"
@@ -117,13 +126,14 @@ memberNameDefault fileName k =
         [] -> Nothing
         x:xs -> return $ mconcat (appToHead T.toLower x : (appToHead T.toUpper <$> xs))
 
-onModuleDefault :: OnModule ud
-onModuleDefault stg scFile =
+onModuleDefault :: HasSchemaSetting a => OnModule a
+onModuleDefault arg scFile =
   do
     nmText <- typeNameDefault scFile
     nm <- return $ mkName $ T.unpack nmText
     return (nm, decl nm)
   where
+    stg = getSchemaSetting arg
     decl nm =
       do
         let scPath = T.unpack (schemaBaseDir stg) </> T.unpack scFile
@@ -166,7 +176,7 @@ onModuleDefault stg scFile =
                       ]
             | otherwise ->
               do
-                x <- doOnType stg o
+                x <- doOnType arg o
                 putDec $ TySynD nm [] x
 
     makeFields nm o =
@@ -184,7 +194,7 @@ onModuleDefault stg scFile =
         fields <- forM (HM.toList (props :: J.Object)) $ \(k, J.Object o) ->
           do
             let isReq = V.elem k reqList
-            doOnMember stg scFile k isReq o
+            doOnMember arg scFile k isReq o
         return fields
 
     fieldBang = Bang NoSourceUnpackedness SourceStrict
@@ -205,8 +215,8 @@ mkFieldInfo nMem t k op = FieldInfo {..}
     fldToJSON = undefined
 
 -- | For non-zero array members, omited value can be represented by empty array
-onMember_nonzeroArray :: OnMember ud
-onMember_nonzeroArray stg scFile k req o =
+onMember_nonzeroArray :: HasSchemaSetting a => OnMember a
+onMember_nonzeroArray arg scFile k req o =
   do
     guard $ not req
     checkType o "array"
@@ -215,32 +225,34 @@ onMember_nonzeroArray stg scFile k req o =
 
     return $
       do
-        t <- doOnType stg o
+        t <- doOnType arg o
         nMem <- maybe (fail "memberName") return $ memberNameDefault scFile k
         return $ mkFieldInfo nMem t k 'parseNonZeroVector
 
-onMember_opt :: OnMember ud
-onMember_opt stg _ _ True o = Nothing
-onMember_opt stg scFile k False o = Just $
+onMember_opt :: HasSchemaSetting a => OnMember a
+onMember_opt _ _ _ True o = Nothing
+onMember_opt arg scFile k False o = Just $
   do
-    t <- doOnType stg o
+    t <- doOnType arg o
     nMem <- maybe (fail "memberName") return $ memberNameDefault scFile k
     return $ mkFieldInfo nMem (AppT (ConT ''Maybe) t) k '(J..:?)
     
-onMember_default :: OnMember ud
-onMember_default stg scFile k _ o = Just $
-  do
-    t <- doOnType stg o
+onMember_default :: HasSchemaSetting a => OnMember a
+onMember_default arg scFile k _ o = Just $
+  do    
+    t <- doOnType arg o
     nMem <- maybe (fail "memberName") return $ memberNameDefault scFile k
     return $ mkFieldInfo nMem t k '(J..:)
 
-doOnMember :: SchemaSetting ud -> SchemaFile -> MemberName -> IsRequired -> J.Object -> SCQ FieldInfo
-doOnMember stg s n req o =
-    either id id $ findTop "onMember" $
-        onMember stg <*> pure stg <*> pure s <*> pure n <*> pure req <*> pure o
+doOnMember :: HasSchemaSetting a => a -> SchemaFile -> MemberName -> IsRequired -> J.Object -> SCQ FieldInfo
+doOnMember arg s n req o =
+    either id id $
+        findTop "onMember"
+            [ onm arg s n req o | onm <- onMember (getSchemaSetting arg) ]
 
-doOnType :: SchemaSetting ud -> J.Object -> SCQ Type
-doOnType stg o = either id id $ findTop "onType" $ onType stg <*> pure stg <*> pure o
+doOnType :: HasSchemaSetting a => a -> J.Object -> SCQ Type
+doOnType arg o =
+    either id id $ findTop "onType" [ ont arg o | ont <- onType (getSchemaSetting arg) ]
 
 checkType :: J.Object -> Text -> Maybe ()
 checkType o tCheck =
@@ -249,7 +261,7 @@ checkType o tCheck =
     guard $ t == tCheck
 
 
-onType_array :: OnType ud
+onType_array :: HasSchemaSetting a => OnType a
 onType_array stg o =
   do
     checkType o "array"
@@ -284,54 +296,53 @@ onType_bool _ o =
     checkType o "boolean"
     return $ return (ConT ''Bool)
 
-onType_dict :: OnType ud
-onType_dict stg o =
+onType_dict :: HasSchemaSetting a => OnType a
+onType_dict arg o =
   do
     checkType o "object"
     guard $ HM.lookup "properties" o == Nothing
     aprop <- resultM . J.fromJSON =<< HM.lookup "additionalProperties" o
     return $
       do
-        t <- doOnType stg aprop
+        t <- doOnType arg aprop
         return $ ConT ''HashMap `AppT` ConT ''Text `AppT` t
 
 
-onType_ref :: OnType ud
-onType_ref stg o =
+onType_ref :: HasSchemaSetting a => OnType a
+onType_ref arg o =
   do
     s <- resultM . J.fromJSON =<< HM.lookup "$ref" o
 
     return $
       do
-        n <- doOnModule stg s
+        n <- doOnModule arg s
         return $ ConT n
 
-onType_allOf :: OnType ud
-onType_allOf stg o =
+onType_allOf :: HasSchemaSetting a => OnType a
+onType_allOf arg o =
   do
     x : _ <- resultM . J.fromJSON =<< HM.lookup "allOf" o
     xObj <- resultM $ J.fromJSON x
 
     return $
       do
-        doOnType stg xObj
+        doOnType arg xObj
     
 
 
-onType_fallback :: OnType ud
+onType_fallback :: OnType a
 onType_fallback _ _ = Just $ return (ConT ''JSONValue)
     
 
-defaultSchemaSetting :: Text -> SchemaSetting ()
+defaultSchemaSetting :: HasSchemaSetting a => Text -> SchemaSetting a
 defaultSchemaSetting path = SchemaSetting {
     schemaBaseDir = path,
     onType = onTypeDefaultList,
     onModule = [onModuleDefault],
-    onMember = onMemberDefaultList,
-    userData = ()
+    onMember = onMemberDefaultList
   }
 
-onTypeDefaultList :: [OnType ud]
+onTypeDefaultList :: HasSchemaSetting a => [OnType a]
 onTypeDefaultList = [
     onType_array,
     onType_ref,
@@ -344,15 +355,15 @@ onTypeDefaultList = [
     onType_fallback
   ]
 
-onMemberDefaultList :: [OnMember ud]
+onMemberDefaultList :: HasSchemaSetting a => [OnMember a]
 onMemberDefaultList = [
     onMember_nonzeroArray,
     onMember_opt,
     onMember_default
   ]
 
-doOnModule :: SchemaSetting ud -> SchemaFile -> SCQ Name
-doOnModule stg s =
+doOnModule :: HasSchemaSetting a => a -> SchemaFile -> SCQ Name
+doOnModule arg s =
   do
     iom <- snd <$> ask
     prev <- Map.lookup s <$> liftIO (readIORef iom)
@@ -362,7 +373,7 @@ doOnModule stg s =
             return n
         Nothing ->
             either id execAndRegister $
-                findTop "onModule" $ onModule stg <*> pure stg <*> pure s
+                findTop "onModule" [ onm arg s | onm <-  onModule (getSchemaSetting arg) ]
   where
     execAndRegister (n, action) =
       do
@@ -371,7 +382,7 @@ doOnModule stg s =
         action
         return n :: SCQ Name
 
-fromSchema :: SchemaSetting ud -> Text -> DecsQ
+fromSchema :: HasSchemaSetting a => a -> Text -> DecsQ
 fromSchema stg scFile =
   do
     d <- liftIO $ newIORef $ Endo id
