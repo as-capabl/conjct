@@ -72,7 +72,7 @@ type OnModule ud = ud -> SchemaFile -> Maybe (Name, SCQ ())
 type OnMember ud = ud -> SchemaFile -> MemberName -> IsRequired -> J.Object -> Maybe (SCQ FieldInfo)
 
 data SchemaSetting ud = SchemaSetting {
-    schemaBaseDir :: Text,
+    readModuleFile :: ud -> Text -> SCQ J.Object,
     onType :: [OnType ud],
     onModule :: [OnModule ud],
     onMember :: [OnMember ud]
@@ -136,10 +136,8 @@ onModuleDefault arg scFile =
     stg = getSchemaSetting arg
     decl nm =
       do
-        let scPath = T.unpack (schemaBaseDir stg) </> T.unpack scFile
-        o <- liftIO (J.decodeFileStrict scPath) >>=
-            maybe (fail $ "File read error:" ++ scPath) return
-        vType <- maybe (fail $ "No type: " ++ T.unpack scFile) return $  HM.lookup "type" (o :: J.Object)
+        o <- readModuleFile stg arg scFile
+        vType <- maybe (fail $ "No type: " ++ T.unpack scFile) return $  HM.lookup "type" o
         t <- resultM $ J.fromJSON vType
         if  | (t :: Text) == "object" -> 
               do
@@ -199,6 +197,13 @@ onModuleDefault arg scFile =
 
     fieldBang = Bang NoSourceUnpackedness SourceStrict
 
+readModuleFileDefault :: Text -> a -> Text -> SCQ J.Object
+readModuleFileDefault scBaseDir _ scFile =
+  do
+    let scPath = T.unpack scBaseDir </> T.unpack scFile
+    r <- liftIO (J.decodeFileStrict scPath)
+    maybe (fail $ "File read error:" ++ scPath) return r
+
 findTop :: MonadFail m => Text -> [Maybe a] -> Either (m b) a
 findTop s l = case catMaybes l
   of
@@ -206,12 +211,10 @@ findTop s l = case catMaybes l
     x:_ -> Right x
 
 
-mkFieldInfo nMem t k op = FieldInfo {..}
+mkFieldInfo hsNameStr fldType fldJSONName op = FieldInfo {..}
   where
-    fldType = t
-    fldJSONName = k
-    fldHsName = mkName $ T.unpack nMem
-    fldFromJSON = \vn -> VarE op `AppE` VarE vn `AppE` LitE (StringL $ T.unpack k)
+    fldHsName = mkName $ T.unpack hsNameStr
+    fldFromJSON = \vn -> VarE op `AppE` VarE vn `AppE` LitE (StringL $ T.unpack fldJSONName)
     fldToJSON = undefined
 
 -- | For non-zero array members, omited value can be represented by empty array
@@ -336,7 +339,7 @@ onType_fallback _ _ = Just $ return (ConT ''JSONValue)
 
 defaultSchemaSetting :: HasSchemaSetting a => Text -> SchemaSetting a
 defaultSchemaSetting path = SchemaSetting {
-    schemaBaseDir = path,
+    readModuleFile = readModuleFileDefault path,
     onType = onTypeDefaultList,
     onModule = [onModuleDefault],
     onMember = onMemberDefaultList
