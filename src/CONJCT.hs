@@ -4,6 +4,8 @@
 {-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE FlexibleContexts #-}
 
 module
     CONJCT
@@ -67,26 +69,41 @@ data FieldInfo = FieldInfo {
     fldToJSON :: Name -> Exp
   }
 
-type OnType ud = ud -> J.Object -> Maybe (SCQ Type)
-type OnModule ud = ud -> SchemaFile -> Maybe (Name, SCQ ())
-type OnMember ud = ud -> SchemaFile -> MemberName -> IsRequired -> J.Object -> Maybe (SCQ FieldInfo)
+type OnType a = a -> J.Object -> Maybe (SCQ Type)
+type OnModule a = a -> SchemaFile -> Maybe (Name, SCQ ())
+type OnMember a = a -> RelatedModuleSummary a -> MemberName -> J.Object -> Maybe (SCQ FieldInfo)
 
-data SchemaSetting ud = SchemaSetting {
-    readModuleFile :: ud -> Text -> SCQ J.Object,
-    onType :: [OnType ud],
-    onModule :: [OnModule ud],
-    onMember :: [OnMember ud]
+data SchemaSetting a = SchemaSetting {
+    readModuleFile :: a -> Text -> SCQ (J.Object, RelatedModuleSummary a),
+    onType :: [OnType a],
+    onModule :: [OnModule a],
+    onMember :: [OnMember a]
   }
 
-class HasSchemaSetting a
+data ModuleSummary = ModuleSummary {
+    msModuleName :: SchemaFile,
+    msRequiredList :: Vector MemberName
+  }
+
+class HasModuleSummary (RelatedModuleSummary a) => HasSchemaSetting a
   where
     getSchemaSetting :: a -> SchemaSetting a
+    type RelatedModuleSummary a :: *
+    type RelatedModuleSummary a = ModuleSummary
 
 newtype SimpleSchemaSetting = SimpleSchemaSetting (SchemaSetting SimpleSchemaSetting)
+
+class HasModuleSummary a
+  where
+    getModuleSummary :: a -> ModuleSummary
 
 instance HasSchemaSetting SimpleSchemaSetting
   where
     getSchemaSetting (SimpleSchemaSetting x) = x
+
+instance HasModuleSummary ModuleSummary
+  where
+    getModuleSummary = id
 
 schemaSuffix :: Text
 schemaSuffix = ".schema.json"
@@ -136,12 +153,12 @@ onModuleDefault arg scFile =
     stg = getSchemaSetting arg
     decl nm =
       do
-        o <- readModuleFile stg arg scFile
+        (o, ms) <- readModuleFile stg arg scFile
         vType <- maybe (fail $ "No type: " ++ T.unpack scFile) return $  HM.lookup "type" o
         t <- resultM $ J.fromJSON vType
         if  | (t :: Text) == "object" -> 
               do
-                fields <- makeFields nm o
+                fields <- makeFields ms nm o
                 let conFields = (\FieldInfo{..} -> (fldHsName, fieldBang, fldType)) <$> fields
 
                 putDec $
@@ -177,7 +194,7 @@ onModuleDefault arg scFile =
                 x <- doOnType arg o
                 putDec $ TySynD nm [] x
 
-    makeFields nm o =
+    makeFields ms nm o =
       do
         -- properties
         vProps <- 
@@ -185,24 +202,28 @@ onModuleDefault arg scFile =
                 HM.lookup "properties" (o :: J.Object)
         props <- resultM $ J.fromJSON vProps
 
-        -- required
-        let reqList = fromMaybe V.empty $
-                resultM . J.fromJSON @(Vector Text) =<< HM.lookup "required" o
-
         fields <- forM (HM.toList (props :: J.Object)) $ \(k, J.Object o) ->
           do
-            let isReq = V.elem k reqList
-            doOnMember arg scFile k isReq o
+            doOnMember arg ms k o
         return fields
 
     fieldBang = Bang NoSourceUnpackedness SourceStrict
 
-readModuleFileDefault :: Text -> a -> Text -> SCQ J.Object
+isRequired :: HasModuleSummary a => a -> MemberName -> Bool
+isRequired ms mn = V.elem mn (msRequiredList . getModuleSummary $ ms)
+
+readModuleFileDefault :: Text -> a -> Text -> SCQ (J.Object, ModuleSummary)
 readModuleFileDefault scBaseDir _ scFile =
   do
     let scPath = T.unpack scBaseDir </> T.unpack scFile
-    r <- liftIO (J.decodeFileStrict scPath)
-    maybe (fail $ "File read error:" ++ scPath) return r
+    mo <- liftIO (J.decodeFileStrict scPath)
+    o <- maybe (fail $ "File read error:" ++ scPath) return mo
+
+    let msModuleName = scFile
+        msRequiredList = fromMaybe V.empty $
+                resultM . J.fromJSON @(Vector Text) =<< HM.lookup "required" o
+
+    return (o, ModuleSummary{..})
 
 findTop :: MonadFail m => Text -> [Maybe a] -> Either (m b) a
 findTop s l = case catMaybes l
@@ -219,9 +240,10 @@ mkFieldInfo hsNameStr fldType fldJSONName op = FieldInfo {..}
 
 -- | For non-zero array members, omited value can be represented by empty array
 onMember_nonzeroArray :: HasSchemaSetting a => OnMember a
-onMember_nonzeroArray arg scFile k req o =
+onMember_nonzeroArray arg ms k o =
   do
-    guard $ not req
+    let ModuleSummary{..} = getModuleSummary ms
+    guard $ not (isRequired ms k)
     checkType o "array"
     minItems <- resultM . J.fromJSON =<< HM.lookup "minItems" o
     guard $ minItems > (0 :: Int)
@@ -229,29 +251,34 @@ onMember_nonzeroArray arg scFile k req o =
     return $
       do
         t <- doOnType arg o
-        nMem <- maybe (fail "memberName") return $ memberNameDefault scFile k
+        nMem <- maybe (fail "memberName") return $ memberNameDefault msModuleName k
         return $ mkFieldInfo nMem t k 'parseNonZeroVector
 
 onMember_opt :: HasSchemaSetting a => OnMember a
-onMember_opt _ _ _ True o = Nothing
-onMember_opt arg scFile k False o = Just $
+onMember_opt arg ms k o =
   do
-    t <- doOnType arg o
-    nMem <- maybe (fail "memberName") return $ memberNameDefault scFile k
-    return $ mkFieldInfo nMem (AppT (ConT ''Maybe) t) k '(J..:?)
+    let ModuleSummary{..} = getModuleSummary ms
+    guard $ not (isRequired ms k)
+
+    return $
+      do
+        t <- doOnType arg o
+        nMem <- maybe (fail "memberName") return $ memberNameDefault msModuleName k
+        return $ mkFieldInfo nMem (AppT (ConT ''Maybe) t) k '(J..:?)
     
 onMember_default :: HasSchemaSetting a => OnMember a
-onMember_default arg scFile k _ o = Just $
+onMember_default arg ms k o = Just $
   do    
+    let ModuleSummary{..} = getModuleSummary ms
     t <- doOnType arg o
-    nMem <- maybe (fail "memberName") return $ memberNameDefault scFile k
+    nMem <- maybe (fail "memberName") return $ memberNameDefault msModuleName k
     return $ mkFieldInfo nMem t k '(J..:)
 
-doOnMember :: HasSchemaSetting a => a -> SchemaFile -> MemberName -> IsRequired -> J.Object -> SCQ FieldInfo
-doOnMember arg s n req o =
+doOnMember :: HasSchemaSetting a => a -> RelatedModuleSummary a -> MemberName -> J.Object -> SCQ FieldInfo
+doOnMember arg ms n o =
     either id id $
         findTop "onMember"
-            [ onm arg s n req o | onm <- onMember (getSchemaSetting arg) ]
+            [ onm arg ms n o | onm <- onMember (getSchemaSetting arg) ]
 
 doOnType :: HasSchemaSetting a => a -> J.Object -> SCQ Type
 doOnType arg o =
@@ -337,7 +364,9 @@ onType_fallback :: OnType a
 onType_fallback _ _ = Just $ return (ConT ''JSONValue)
     
 
-defaultSchemaSetting :: HasSchemaSetting a => Text -> SchemaSetting a
+defaultSchemaSetting ::
+    (HasSchemaSetting a, RelatedModuleSummary a ~ ModuleSummary) =>
+    Text -> SchemaSetting a
 defaultSchemaSetting path = SchemaSetting {
     readModuleFile = readModuleFileDefault path,
     onType = onTypeDefaultList,
