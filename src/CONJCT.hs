@@ -11,7 +11,7 @@ module
     CONJCT
 where
 
-import Data.Maybe (fromMaybe, catMaybes)
+import Data.Maybe (fromMaybe, catMaybes, isJust)
 import GHC.Generics (Generic)
 import Language.Haskell.TH
 import qualified Data.Aeson as J
@@ -50,6 +50,12 @@ failQ = liftQ . fail
 resultM :: MonadFail m => J.Result a -> m a
 resultM (J.Error s) = fail s
 resultM (J.Success x) = return x
+
+lookupJM :: (J.FromJSON a, MonadFail m) => Text -> J.Object -> m a
+lookupJM n o = 
+  do
+    v <- maybe (fail $ "No member named " ++ T.unpack n) return $ HM.lookup n o
+    resultM $ J.fromJSON v
 
 putDec :: Dec -> SCQ ()
 putDec dec =
@@ -150,7 +156,7 @@ memberNameDefault fileName k =
 onModule_object :: HasSchemaSetting a => OnModule a
 onModule_object arg ms o =
   do
-    checkType o "object"
+    guard $ o `isType` "object"
     return $
       do
         nm <- typeNameOfModule (getSchemaSetting arg) arg ms
@@ -191,7 +197,7 @@ onModule_object arg ms o =
 
     fieldBang = Bang NoSourceUnpackedness SourceStrict
 
-    deriveClause = DerivClause (Just StockStrategy) [
+    deriveClause = DerivClause Nothing [
         ConT ''Eq,
         ConT ''Show,
         ConT ''Generic
@@ -217,7 +223,7 @@ readModuleFileDefault scBaseDir _ scFile =
 
     let msModuleName = scFile
         msRequiredList = fromMaybe V.empty $
-            resultM . J.fromJSON =<< HM.lookup "required" o
+            lookupJM "required" o
 
     return (o, ModuleSummary{..})
 
@@ -242,8 +248,8 @@ onMember_nonzeroArray arg ms k o =
   do
     let ModuleSummary{..} = getModuleSummary ms
     guard $ not (isRequired ms k)
-    checkType o "array"
-    minItems <- resultM . J.fromJSON =<< HM.lookup "minItems" o
+    guard $ o `isType` "array"
+    minItems <- lookupJM "minItems" o
     guard $ minItems > (0 :: Int)
 
     return $
@@ -286,54 +292,54 @@ doOnType :: HasSchemaSetting a => a -> J.Object -> SCQ Type
 doOnType arg o =
     either id id $ findTop "onType" [ ont arg o | ont <- onType (getSchemaSetting arg) ]
 
-checkType :: J.Object -> Text -> Maybe ()
-checkType o tCheck =
+isType :: J.Object -> Text -> Bool
+isType o tCheck = isJust $
   do
-    t <- resultM . J.fromJSON =<< HM.lookup "type" o
+    t <- lookupJM "type" o
     guard $ t == tCheck
-
+    return ()
 
 onType_array :: HasSchemaSetting a => OnType a
 onType_array stg o =
   do
-    checkType o "array"
-    oItem <- resultM . J.fromJSON =<< HM.lookup "items" o
+    guard $ o `isType` "array"
+    oItem <- lookupJM "items" o
 
     return $
       do
         t <- doOnType stg oItem
         return $ AppT (ConT ''Vector) t
 
-onType_int :: OnType ud
+onType_int :: OnType a
 onType_int _ o =
   do
-    checkType o "integer"
+    guard $ o `isType` "integer" :: Maybe ()
     return $ return (ConT ''Int)
 
-onType_number :: OnType ud
+onType_number :: OnType a
 onType_number _ o =
   do
-    checkType o "number"
+    guard $ o `isType` "number"
     return $ return (ConT ''Double)
 
-onType_text :: OnType ud
+onType_text :: OnType a
 onType_text _ o =
   do
-    checkType o "string"
+    guard $ o `isType` "string"
     return $ return (ConT ''Text)
 
-onType_bool :: OnType ud
+onType_bool :: OnType a
 onType_bool _ o =
   do
-    checkType o "boolean"
+    guard $ o `isType` "boolean"
     return $ return (ConT ''Bool)
 
 onType_dict :: HasSchemaSetting a => OnType a
 onType_dict arg o =
   do
-    checkType o "object"
+    guard $ o `isType` "object"
     guard $ HM.lookup "properties" o == Nothing
-    aprop <- resultM . J.fromJSON =<< HM.lookup "additionalProperties" o
+    aprop <- lookupJM "additionalProperties" o
     return $
       do
         t <- doOnType arg aprop
@@ -343,7 +349,7 @@ onType_dict arg o =
 onType_ref :: HasSchemaSetting a => OnType a
 onType_ref arg o =
   do
-    s <- resultM . J.fromJSON =<< HM.lookup "$ref" o
+    s <- lookupJM "$ref" o
 
     return $
       do
@@ -353,14 +359,12 @@ onType_ref arg o =
 onType_allOf :: HasSchemaSetting a => OnType a
 onType_allOf arg o =
   do
-    x : _ <- resultM . J.fromJSON =<< HM.lookup "allOf" o
+    x : _ <- lookupJM "allOf" o
     xObj <- resultM $ J.fromJSON x
 
     return $
       do
         doOnType arg xObj
-    
-
 
 onType_fallback :: OnType a
 onType_fallback _ _ = Just $ return (ConT ''JSONValue)
