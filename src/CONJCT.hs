@@ -80,15 +80,16 @@ type OnModule a = a -> RelatedModuleSummary a -> J.Object -> Maybe (SCQ ())
 type OnMember a = a -> RelatedModuleSummary a -> MemberName -> J.Object -> Maybe (SCQ FieldInfo)
 
 data SchemaSetting a = SchemaSetting {
-    readModuleFile :: a -> Text -> SCQ (J.Object, RelatedModuleSummary a),
+    readModuleFile :: a -> Text -> SCQ (RelatedModuleSummary a, J.Object),
     typeNameOfModule :: a -> RelatedModuleSummary a -> SCQ Name,
+    memberName :: a -> RelatedModuleSummary a -> Text -> SCQ MemberName,
     onType :: [OnType a],
     onModule :: [OnModule a],
     onMember :: [OnMember a]
   }
 
 data ModuleSummary = ModuleSummary {
-    msModuleName :: SchemaFile,
+    msSchemaFile :: SchemaFile,
     msRequiredList :: Vector MemberName
   }
 
@@ -97,6 +98,9 @@ class HasSchemaSetting a
     getSchemaSetting :: a -> SchemaSetting a
     type RelatedModuleSummary a :: *
     type RelatedModuleSummary a = ModuleSummary
+
+callSchemaSetting :: HasSchemaSetting a => (SchemaSetting a -> a -> b) -> a -> b
+callSchemaSetting f arg = f (getSchemaSetting arg) arg
 
 newtype SimpleSchemaSetting = SimpleSchemaSetting (SchemaSetting SimpleSchemaSetting)
 
@@ -138,29 +142,33 @@ typeNameDefault :: HasModuleSummary ms => ms -> SCQ Name
 typeNameDefault ms =
   do
     let ModuleSummary {..} = getModuleSummary ms
-    maybe (fail $ "typeNameDefault: Cannot generate name for " ++ T.unpack msModuleName) return $
+    maybe (fail $ "typeNameDefault: Cannot generate name for " ++ T.unpack msSchemaFile) return $
       do
-        nm <- tokenize <$> unSuffix msModuleName
+        nm <- tokenize <$> unSuffix msSchemaFile
         return $ mkName . T.unpack $ mconcat (appToHead T.toUpper <$> nm)
 
-memberNameDefault :: Text -> Text -> Maybe Text
-memberNameDefault fileName k =
+memberNameDefault :: (MonadFail m, HasModuleSummary ms) => ms -> Text -> m MemberName
+memberNameDefault ms k = maybe (fail errMsg) return $
   do
-    sTy <- tokenize <$> unSuffix fileName
+    sTy <- tokenize <$> unSuffix msSchemaFile
     let sMem = tokenize k
     case sTy ++ sMem
       of
         [] -> Nothing
         x:xs -> return $ mconcat (appToHead T.toLower x : (appToHead T.toUpper <$> xs))
+  where
+    ModuleSummary{..} = getModuleSummary ms
+    errMsg = "memberNameDefault: Could not generate a name for " ++ T.unpack k
 
 onModule_object :: HasSchemaSetting a => OnModule a
 onModule_object arg ms o =
   do
     guard $ o `isType` "object"
+    props <- lookupJM "properties" o
     return $
       do
-        nm <- typeNameOfModule (getSchemaSetting arg) arg ms
-        fields <- makeFields ms o
+        nm <- callSchemaSetting typeNameOfModule arg ms
+        fields <- makeFields ms props
         let conFields = (\FieldInfo{..} -> (fldHsName, fieldBang, fldType)) <$> fields
         putDec $
             DataD [] nm [] Nothing [RecC nm conFields] [deriveClause]
@@ -182,17 +190,11 @@ onModule_object arg ms o =
                   ]
               ]
   where
-    makeFields ms o =
+    makeFields ms props =
       do
-        -- properties
-        vProps <- 
-            maybe (fail $ "No properties: " ++ show o) return $
-                HM.lookup "properties" (o :: J.Object)
-        props <- resultM $ J.fromJSON vProps
-
-        fields <- forM (HM.toList (props :: J.Object)) $ \(k, J.Object o) ->
+        fields <- forM (HM.toList (props :: J.Object)) $ \(k, J.Object oMem) ->
           do
-            doOnMember arg ms k o
+            doOnMember arg ms k oMem
         return fields
 
     fieldBang = Bang NoSourceUnpackedness SourceStrict
@@ -206,7 +208,7 @@ onModule_object arg ms o =
 onModule_knownType :: HasSchemaSetting a => OnModule a
 onModule_knownType arg ms o = Just $
   do
-    nm <- typeNameOfModule (getSchemaSetting arg) arg ms
+    nm <- callSchemaSetting typeNameOfModule arg ms
     x <- doOnType arg o
     putDec $ TySynD nm [] x
 
@@ -214,18 +216,16 @@ onModule_knownType arg ms o = Just $
 isRequired :: HasModuleSummary a => a -> MemberName -> Bool
 isRequired ms mn = V.elem mn (msRequiredList . getModuleSummary $ ms)
 
-readModuleFileDefault :: Text -> a -> Text -> SCQ (J.Object, ModuleSummary)
+readModuleFileDefault :: Text -> a -> Text -> SCQ (ModuleSummary, J.Object)
 readModuleFileDefault scBaseDir _ scFile =
   do
     let scPath = T.unpack scBaseDir </> T.unpack scFile
     mo <- liftIO (J.decodeFileStrict scPath)
     o <- maybe (fail $ "File read error:" ++ scPath) return mo
 
-    let msModuleName = scFile
-        msRequiredList = fromMaybe V.empty $
-            lookupJM "required" o
-
-    return (o, ModuleSummary{..})
+    let msSchemaFile = scFile
+        msRequiredList = fromMaybe V.empty $ lookupJM "required" o
+    return (ModuleSummary{..}, o)
 
 findTop :: MonadFail m => Text -> [Maybe a] -> Either (m b) a
 findTop s l = case catMaybes l
@@ -255,7 +255,7 @@ onMember_nonzeroArray arg ms k o =
     return $
       do
         t <- doOnType arg o
-        nMem <- maybe (fail "memberName") return $ memberNameDefault msModuleName k
+        nMem <- callSchemaSetting memberName arg ms k
         return $ mkFieldInfo nMem t k 'parseNonZeroVector
 
 onMember_opt ::
@@ -269,7 +269,7 @@ onMember_opt arg ms k o =
     return $
       do
         t <- doOnType arg o
-        nMem <- maybe (fail "memberName") return $ memberNameDefault msModuleName k
+        nMem <- callSchemaSetting memberName arg ms k
         return $ mkFieldInfo nMem (AppT (ConT ''Maybe) t) k '(J..:?)
     
 onMember_default ::
@@ -279,7 +279,7 @@ onMember_default arg ms k o = Just $
   do    
     let ModuleSummary{..} = getModuleSummary ms
     t <- doOnType arg o
-    nMem <- maybe (fail "memberName") return $ memberNameDefault msModuleName k
+    nMem <- callSchemaSetting memberName arg ms k
     return $ mkFieldInfo nMem t k '(J..:)
 
 doOnMember :: HasSchemaSetting a => a -> RelatedModuleSummary a -> MemberName -> J.Object -> SCQ FieldInfo
@@ -364,6 +364,7 @@ defaultSchemaSetting ::
 defaultSchemaSetting path = SchemaSetting {
     readModuleFile = readModuleFileDefault path,
     typeNameOfModule = \_ -> typeNameDefault,
+    memberName = \_ -> memberNameDefault,
     onType = onTypeDefaultList,
     onModule = onModuleDefaultList,
     onMember = onMemberDefaultList
@@ -409,7 +410,7 @@ doOnModule arg scFile =
     stg = getSchemaSetting arg
     newRegister =
       do
-        (o, ms) <- readModuleFile stg arg scFile
+        (ms, o) <- readModuleFile stg arg scFile
         nm <- typeNameOfModule stg arg ms
         either id id $
             findTop "onModule" [ onm arg ms o | onm <- onModule (getSchemaSetting arg) ]
