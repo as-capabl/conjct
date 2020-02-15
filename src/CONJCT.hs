@@ -297,18 +297,13 @@ isType o tCheck = isJust $
   do
     t <- lookupJM "type" o
     guard $ t == tCheck
-    return ()
 
 onType_array :: HasSchemaSetting a => OnType a
 onType_array stg o =
   do
     guard $ o `isType` "array"
     oItem <- lookupJM "items" o
-
-    return $
-      do
-        t <- doOnType stg oItem
-        return $ AppT (ConT ''Vector) t
+    return $ AppT (ConT ''Vector) <$> doOnType stg oItem
 
 onType_int :: OnType a
 onType_int _ o =
@@ -350,21 +345,14 @@ onType_ref :: HasSchemaSetting a => OnType a
 onType_ref arg o =
   do
     s <- lookupJM "$ref" o
+    return $ ConT <$> doOnModule arg s
 
-    return $
-      do
-        n <- doOnModule arg s
-        return $ ConT n
-
+-- |allOf keyword; apply only the first schema
 onType_allOf :: HasSchemaSetting a => OnType a
 onType_allOf arg o =
   do
     x : _ <- lookupJM "allOf" o
-    xObj <- resultM $ J.fromJSON x
-
-    return $
-      do
-        doOnType arg xObj
+    return $ doOnType arg x
 
 onType_fallback :: OnType a
 onType_fallback _ _ = Just $ return (ConT ''JSONValue)
