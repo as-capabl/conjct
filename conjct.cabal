@@ -19,6 +19,7 @@ library
   exposed-modules:     CONJCT, CONJCT.Util
   -- other-modules:
   -- other-extensions:
+  ghc-options:         -Wall
   build-depends:    base >=4.11 && <5.0
                   , template-haskell -any
                   , aeson

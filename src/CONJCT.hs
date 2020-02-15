@@ -15,11 +15,7 @@ import Data.Maybe (fromMaybe, catMaybes, isJust)
 import GHC.Generics (Generic)
 import Language.Haskell.TH
 import qualified Data.Aeson as J
-import qualified Data.Aeson.Types as J
-import Data.Aeson ((.:))
-import Control.Monad.Trans.Maybe
 import Control.Monad.Reader
-import Control.Monad.IO.Class
 import Control.Monad.Fail (MonadFail)
 import Data.IORef
 import Data.Map (Map)
@@ -60,7 +56,7 @@ lookupJM n o =
 putDec :: Dec -> SCQ ()
 putDec dec =
   do
-    (ioDecs, _) <- ask
+    ioDecs <- asks fst
     liftIO $ modifyIORef' ioDecs $ (<> Endo (dec:))
 
 type SchemaFile = Text
@@ -143,7 +139,7 @@ typeNameDefault :: HasModuleSummary ms => ms -> SCQ TypeName
 typeNameDefault ms =
   do
     let ModuleSummary {..} = getModuleSummary ms
-    maybe (fail $ "typeNameDefault: Cannot generate name for " ++ T.unpack msSchemaFile) return $
+    maybe (fail $ "typeNameDefault: Could not generate a name for " ++ T.unpack msSchemaFile) return $
       do
         nm <- tokenize <$> unSuffix msSchemaFile
         return $ mconcat (appToHead T.toUpper <$> nm)
@@ -169,7 +165,7 @@ onModule_object arg ms o =
     return $
       do
         nm <- mkName . T.unpack <$> callSchemaSetting typeNameOfModule arg ms
-        fields <- makeFields ms props
+        fields <- makeFields props
         let conFields = (\FieldInfo{..} -> (fldHsName, fieldBang, fldType)) <$> fields
         putDec $
             DataD [] nm [] Nothing [RecC nm conFields] [deriveClause]
@@ -191,12 +187,9 @@ onModule_object arg ms o =
                   ]
               ]
   where
-    makeFields ms props =
-      do
-        fields <- forM (HM.toList (props :: J.Object)) $ \(k, J.Object oMem) ->
-          do
-            doOnMember arg ms k oMem
-        return fields
+    makeFields = mapM doMember' . HM.toList
+    doMember' (k, J.Object oMem) = doOnMember arg ms k oMem
+    doMember' (k, _) = fail $ "onModule_object: illegal member definition for " ++ T.unpack k
 
     fieldBang = Bang NoSourceUnpackedness SourceStrict
 
@@ -234,9 +227,10 @@ findTop s l = case catMaybes l
     [] -> fail $ "No appropreate handler: " <> T.unpack s
     x:_ -> x
 
-mkFieldInfo hsNameStr fldType fldJSONName op = FieldInfo {..}
+mkFieldInfo :: MemberName -> Type -> Text -> Name -> FieldInfo
+mkFieldInfo hsName fldType fldJSONName op = FieldInfo {..}
   where
-    fldHsName = mkName $ T.unpack hsNameStr
+    fldHsName = mkName $ T.unpack hsName
     fldFromJSON = \vn -> VarE op `AppE` VarE vn `AppE` LitE (StringL $ T.unpack fldJSONName)
     fldToJSON = undefined
 
@@ -246,7 +240,6 @@ onMember_nonzeroArray ::
     OnMember a
 onMember_nonzeroArray arg ms k o =
   do
-    let ModuleSummary{..} = getModuleSummary ms
     guard $ not (isRequired ms k)
     guard $ o `isType` "array"
     minItems <- lookupJM "minItems" o
@@ -263,7 +256,6 @@ onMember_opt ::
     OnMember a
 onMember_opt arg ms k o =
   do
-    let ModuleSummary{..} = getModuleSummary ms
     guard $ not (isRequired ms k)
 
     return $
@@ -276,8 +268,7 @@ onMember_default ::
     (HasSchemaSetting a, HasModuleSummary (RelatedModuleSummary a)) =>
     OnMember a
 onMember_default arg ms k o = Just $
-  do    
-    let ModuleSummary{..} = getModuleSummary ms
+  do
     t <- doOnType arg o
     nMem <- callSchemaSetting memberName arg ms k
     return $ mkFieldInfo nMem t k '(J..:)
@@ -332,7 +323,7 @@ onType_dict :: HasSchemaSetting a => OnType a
 onType_dict arg o =
   do
     guard $ o `isType` "object"
-    guard $ HM.lookup "properties" o == Nothing
+    guard $ not (HM.member "properties" o)
     aprop <- lookupJM "additionalProperties" o
     return $
       do
@@ -402,7 +393,7 @@ onMemberDefaultList = [
 doOnModule :: HasSchemaSetting a => a -> SchemaFile -> SCQ Name
 doOnModule arg scFile =
   do
-    iom <- snd <$> ask
+    iom <- asks snd
     prev <- Map.lookup scFile <$> liftIO (readIORef iom)
     mkName . T.unpack <$> maybe newRegister return prev
   where
@@ -411,7 +402,7 @@ doOnModule arg scFile =
         (ms, o) <- callSchemaSetting readModuleFile arg scFile
         nm <- callSchemaSetting typeNameOfModule arg ms
         findTop "onModule" [ onm arg ms o | onm <- onModule (getSchemaSetting arg) ]
-        iom <- snd <$> ask
+        iom <- asks snd
         liftIO $ modifyIORef' iom $ Map.insert scFile nm
         return nm
 
@@ -420,6 +411,6 @@ fromSchema stg scFile =
   do
     d <- liftIO $ newIORef $ Endo id
     m <- liftIO $ newIORef Map.empty
-    runReaderT (doOnModule stg scFile) (d, m)
+    _ <- runReaderT (doOnModule stg scFile) (d, m)
     dEndo <- liftIO $ readIORef d
     return $ appEndo dEndo []
