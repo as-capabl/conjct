@@ -85,7 +85,7 @@ data ModuleSummary = ModuleSummary {
     msRequiredList :: Vector MemberName
   }
 
-class HasModuleSummary (RelatedModuleSummary a) => HasSchemaSetting a
+class HasSchemaSetting a
   where
     getSchemaSetting :: a -> SchemaSetting a
     type RelatedModuleSummary a :: *
@@ -239,7 +239,9 @@ mkFieldInfo hsNameStr fldType fldJSONName op = FieldInfo {..}
     fldToJSON = undefined
 
 -- | For non-zero array members, omited value can be represented by empty array
-onMember_nonzeroArray :: HasSchemaSetting a => OnMember a
+onMember_nonzeroArray ::
+    (HasSchemaSetting a, HasModuleSummary (RelatedModuleSummary a)) =>
+    OnMember a
 onMember_nonzeroArray arg ms k o =
   do
     let ModuleSummary{..} = getModuleSummary ms
@@ -254,7 +256,9 @@ onMember_nonzeroArray arg ms k o =
         nMem <- maybe (fail "memberName") return $ memberNameDefault msModuleName k
         return $ mkFieldInfo nMem t k 'parseNonZeroVector
 
-onMember_opt :: HasSchemaSetting a => OnMember a
+onMember_opt ::
+    (HasSchemaSetting a, HasModuleSummary (RelatedModuleSummary a)) =>
+    OnMember a
 onMember_opt arg ms k o =
   do
     let ModuleSummary{..} = getModuleSummary ms
@@ -266,7 +270,9 @@ onMember_opt arg ms k o =
         nMem <- maybe (fail "memberName") return $ memberNameDefault msModuleName k
         return $ mkFieldInfo nMem (AppT (ConT ''Maybe) t) k '(J..:?)
     
-onMember_default :: HasSchemaSetting a => OnMember a
+onMember_default ::
+    (HasSchemaSetting a, HasModuleSummary (RelatedModuleSummary a)) =>
+    OnMember a
 onMember_default arg ms k o = Just $
   do    
     let ModuleSummary{..} = getModuleSummary ms
@@ -387,7 +393,9 @@ onTypeDefaultList = [
     onType_fallback
   ]
 
-onMemberDefaultList :: HasSchemaSetting a => [OnMember a]
+onMemberDefaultList ::
+    (HasSchemaSetting a, HasModuleSummary (RelatedModuleSummary a)) =>
+    [OnMember a]
 onMemberDefaultList = [
     onMember_nonzeroArray,
     onMember_opt,
