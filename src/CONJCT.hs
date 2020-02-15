@@ -70,11 +70,12 @@ data FieldInfo = FieldInfo {
   }
 
 type OnType a = a -> J.Object -> Maybe (SCQ Type)
-type OnModule a = a -> SchemaFile -> Maybe (Name, SCQ ())
+type OnModule a = a -> RelatedModuleSummary a -> J.Object -> Maybe (SCQ ())
 type OnMember a = a -> RelatedModuleSummary a -> MemberName -> J.Object -> Maybe (SCQ FieldInfo)
 
 data SchemaSetting a = SchemaSetting {
     readModuleFile :: a -> Text -> SCQ (J.Object, RelatedModuleSummary a),
+    typeNameOfModule :: a -> RelatedModuleSummary a -> SCQ Name,
     onType :: [OnType a],
     onModule :: [OnModule a],
     onMember :: [OnMember a]
@@ -127,11 +128,14 @@ tokenize = T.splitOn "."
 appToHead :: (Text -> Text) -> Text -> Text
 appToHead f s = let (nmHead, nmTail) = T.splitAt 1 s in f nmHead <> nmTail
 
-typeNameDefault :: Text -> Maybe Text
-typeNameDefault fileName =
+typeNameDefault :: HasModuleSummary ms => ms -> SCQ Name
+typeNameDefault ms =
   do
-    nm <- tokenize <$> unSuffix fileName
-    return $ mconcat (appToHead T.toUpper <$> nm)
+    let ModuleSummary {..} = getModuleSummary ms
+    maybe (fail $ "typeNameDefault: Cannot generate name for " ++ T.unpack msModuleName) return $
+      do
+        nm <- tokenize <$> unSuffix msModuleName
+        return $ mkName . T.unpack $ mconcat (appToHead T.toUpper <$> nm)
 
 memberNameDefault :: Text -> Text -> Maybe Text
 memberNameDefault fileName k =
@@ -143,62 +147,40 @@ memberNameDefault fileName k =
         [] -> Nothing
         x:xs -> return $ mconcat (appToHead T.toLower x : (appToHead T.toUpper <$> xs))
 
-onModuleDefault :: HasSchemaSetting a => OnModule a
-onModuleDefault arg scFile =
+onModule_object :: HasSchemaSetting a => OnModule a
+onModule_object arg ms o =
   do
-    nmText <- typeNameDefault scFile
-    nm <- return $ mkName $ T.unpack nmText
-    return (nm, decl nm)
-  where
-    stg = getSchemaSetting arg
-    decl nm =
+    checkType o "object"
+    return $
       do
-        (o, ms) <- readModuleFile stg arg scFile
-        vType <- maybe (fail $ "No type: " ++ T.unpack scFile) return $  HM.lookup "type" o
-        t <- resultM $ J.fromJSON vType
-        if  | (t :: Text) == "object" -> 
-              do
-                fields <- makeFields ms nm o
-                let conFields = (\FieldInfo{..} -> (fldHsName, fieldBang, fldType)) <$> fields
-
-                putDec $
-                    DataD [] nm [] Nothing [
-                        RecC nm conFields
-                      ]
-                      [
-                        DerivClause (Just StockStrategy) [
-                            ConT ''Eq,
-                            ConT ''Show,
-                            ConT ''Generic
-                          ]
-                      ]
-                
-                myO <- liftQ $ newName "o"
-                putDec $
-                    InstanceD Nothing [] (AppT (ConT ''J.FromJSON) (ConT nm)) [
-                        FunD 'J.parseJSON [
-                            Clause [] (NormalB $
-                                VarE 'J.withObject `AppE` (LitE $ StringL $ nameBase nm) `AppE`
-                                    LamE [VarP myO] (
-                                        foldl
-                                            (\x y -> VarE '(<*>) `AppE` x `AppE` y)
-                                            (VarE 'pure `AppE` ConE nm)
-                                            (($ myO) . fldFromJSON <$> fields)
-                                      )
+        nm <- typeNameOfModule (getSchemaSetting arg) arg ms
+        fields <- makeFields ms o
+        let conFields = (\FieldInfo{..} -> (fldHsName, fieldBang, fldType)) <$> fields
+        putDec $
+            DataD [] nm [] Nothing [RecC nm conFields] [deriveClause]
+        
+        myO <- liftQ $ newName "o"
+        putDec $
+            InstanceD Nothing [] (AppT (ConT ''J.FromJSON) (ConT nm)) [
+                FunD 'J.parseJSON [
+                    Clause [] (NormalB $
+                        VarE 'J.withObject `AppE` (LitE $ StringL $ nameBase nm) `AppE`
+                            LamE [VarP myO] (
+                                foldl
+                                    (\x y -> VarE '(<*>) `AppE` x `AppE` y)
+                                    (VarE 'pure `AppE` ConE nm)
+                                    (($ myO) . fldFromJSON <$> fields)
                               )
-                                []
-                        ]
-                      ]
-            | otherwise ->
-              do
-                x <- doOnType arg o
-                putDec $ TySynD nm [] x
-
-    makeFields ms nm o =
+                      )
+                        []
+                  ]
+              ]
+  where
+    makeFields ms o =
       do
         -- properties
         vProps <- 
-            maybe (fail $ "No properties: " ++ T.unpack scFile) return $
+            maybe (fail $ "No properties: " ++ show o) return $
                 HM.lookup "properties" (o :: J.Object)
         props <- resultM $ J.fromJSON vProps
 
@@ -208,6 +190,20 @@ onModuleDefault arg scFile =
         return fields
 
     fieldBang = Bang NoSourceUnpackedness SourceStrict
+
+    deriveClause = DerivClause (Just StockStrategy) [
+        ConT ''Eq,
+        ConT ''Show,
+        ConT ''Generic
+      ]
+
+onModule_knownType :: HasSchemaSetting a => OnModule a
+onModule_knownType arg ms o = Just $
+  do
+    nm <- typeNameOfModule (getSchemaSetting arg) arg ms
+    x <- doOnType arg o
+    putDec $ TySynD nm [] x
+
 
 isRequired :: HasModuleSummary a => a -> MemberName -> Bool
 isRequired ms mn = V.elem mn (msRequiredList . getModuleSummary $ ms)
@@ -221,7 +217,7 @@ readModuleFileDefault scBaseDir _ scFile =
 
     let msModuleName = scFile
         msRequiredList = fromMaybe V.empty $
-                resultM . J.fromJSON @(Vector Text) =<< HM.lookup "required" o
+            resultM . J.fromJSON =<< HM.lookup "required" o
 
     return (o, ModuleSummary{..})
 
@@ -375,8 +371,9 @@ defaultSchemaSetting ::
     Text -> SchemaSetting a
 defaultSchemaSetting path = SchemaSetting {
     readModuleFile = readModuleFileDefault path,
+    typeNameOfModule = \_ -> typeNameDefault,
     onType = onTypeDefaultList,
-    onModule = [onModuleDefault],
+    onModule = onModuleDefaultList,
     onMember = onMemberDefaultList
   }
 
@@ -393,6 +390,14 @@ onTypeDefaultList = [
     onType_fallback
   ]
 
+onModuleDefaultList ::
+    (HasSchemaSetting a, HasModuleSummary (RelatedModuleSummary a)) =>
+    [OnModule a]
+onModuleDefaultList = [
+    onModule_object,
+    onModule_knownType
+  ]
+
 onMemberDefaultList ::
     (HasSchemaSetting a, HasModuleSummary (RelatedModuleSummary a)) =>
     [OnMember a]
@@ -403,24 +408,22 @@ onMemberDefaultList = [
   ]
 
 doOnModule :: HasSchemaSetting a => a -> SchemaFile -> SCQ Name
-doOnModule arg s =
+doOnModule arg scFile =
   do
     iom <- snd <$> ask
-    prev <- Map.lookup s <$> liftIO (readIORef iom)
-    case prev
-      of
-        Just n -> 
-            return n
-        Nothing ->
-            either id execAndRegister $
-                findTop "onModule" [ onm arg s | onm <-  onModule (getSchemaSetting arg) ]
+    prev <- Map.lookup scFile <$> liftIO (readIORef iom)
+    maybe newRegister return prev
   where
-    execAndRegister (n, action) =
+    stg = getSchemaSetting arg
+    newRegister =
       do
+        (o, ms) <- readModuleFile stg arg scFile
+        nm <- typeNameOfModule stg arg ms
+        either id id $
+            findTop "onModule" [ onm arg ms o | onm <- onModule (getSchemaSetting arg) ]
         iom <- snd <$> ask
-        liftIO $ modifyIORef' iom $ Map.insert s n
-        action
-        return n :: SCQ Name
+        liftIO $ modifyIORef' iom $ Map.insert scFile nm
+        return nm
 
 fromSchema :: HasSchemaSetting a => a -> Text -> DecsQ
 fromSchema stg scFile =
