@@ -33,7 +33,7 @@ import System.FilePath
 
 import CONJCT.Util
 
-type NameMap = Map Text Name
+type NameMap = Map Text TypeName
 type JSONValue = J.Value
 type Vector = Data.Vector.Vector
 type Text = T.Text
@@ -65,6 +65,7 @@ putDec dec =
 
 type SchemaFile = Text
 type MemberName = Text
+type TypeName = Text
 type IsRequired = Bool
 
 data FieldInfo = FieldInfo {
@@ -81,7 +82,7 @@ type OnMember a = a -> RelatedModuleSummary a -> MemberName -> J.Object -> Maybe
 
 data SchemaSetting a = SchemaSetting {
     readModuleFile :: a -> Text -> SCQ (RelatedModuleSummary a, J.Object),
-    typeNameOfModule :: a -> RelatedModuleSummary a -> SCQ Name,
+    typeNameOfModule :: a -> RelatedModuleSummary a -> SCQ TypeName,
     memberName :: a -> RelatedModuleSummary a -> Text -> SCQ MemberName,
     onType :: [OnType a],
     onModule :: [OnModule a],
@@ -138,14 +139,14 @@ tokenize = T.splitOn "."
 appToHead :: (Text -> Text) -> Text -> Text
 appToHead f s = let (nmHead, nmTail) = T.splitAt 1 s in f nmHead <> nmTail
 
-typeNameDefault :: HasModuleSummary ms => ms -> SCQ Name
+typeNameDefault :: HasModuleSummary ms => ms -> SCQ TypeName
 typeNameDefault ms =
   do
     let ModuleSummary {..} = getModuleSummary ms
     maybe (fail $ "typeNameDefault: Cannot generate name for " ++ T.unpack msSchemaFile) return $
       do
         nm <- tokenize <$> unSuffix msSchemaFile
-        return $ mkName . T.unpack $ mconcat (appToHead T.toUpper <$> nm)
+        return $ mconcat (appToHead T.toUpper <$> nm)
 
 memberNameDefault :: (MonadFail m, HasModuleSummary ms) => ms -> Text -> m MemberName
 memberNameDefault ms k = maybe (fail errMsg) return $
@@ -167,7 +168,7 @@ onModule_object arg ms o =
     props <- lookupJM "properties" o
     return $
       do
-        nm <- callSchemaSetting typeNameOfModule arg ms
+        nm <- mkName . T.unpack <$> callSchemaSetting typeNameOfModule arg ms
         fields <- makeFields ms props
         let conFields = (\FieldInfo{..} -> (fldHsName, fieldBang, fldType)) <$> fields
         putDec $
@@ -208,7 +209,7 @@ onModule_object arg ms o =
 onModule_knownType :: HasSchemaSetting a => OnModule a
 onModule_knownType arg ms o = Just $
   do
-    nm <- callSchemaSetting typeNameOfModule arg ms
+    nm <- mkName . T.unpack <$> callSchemaSetting typeNameOfModule arg ms
     x <- doOnType arg o
     putDec $ TySynD nm [] x
 
@@ -227,12 +228,11 @@ readModuleFileDefault scBaseDir _ scFile =
         msRequiredList = fromMaybe V.empty $ lookupJM "required" o
     return (ModuleSummary{..}, o)
 
-findTop :: MonadFail m => Text -> [Maybe a] -> Either (m b) a
+findTop :: MonadFail m => Text -> [Maybe (m a)] -> m a
 findTop s l = case catMaybes l
   of
-    [] -> Left $ fail $ "No appropreate handler: " <> T.unpack s
-    x:_ -> Right x
-
+    [] -> fail $ "No appropreate handler: " <> T.unpack s
+    x:_ -> x
 
 mkFieldInfo hsNameStr fldType fldJSONName op = FieldInfo {..}
   where
@@ -284,13 +284,12 @@ onMember_default arg ms k o = Just $
 
 doOnMember :: HasSchemaSetting a => a -> RelatedModuleSummary a -> MemberName -> J.Object -> SCQ FieldInfo
 doOnMember arg ms n o =
-    either id id $
-        findTop "onMember"
-            [ onm arg ms n o | onm <- onMember (getSchemaSetting arg) ]
+    findTop "onMember"
+        [ onm arg ms n o | onm <- onMember (getSchemaSetting arg) ]
 
 doOnType :: HasSchemaSetting a => a -> J.Object -> SCQ Type
 doOnType arg o =
-    either id id $ findTop "onType" [ ont arg o | ont <- onType (getSchemaSetting arg) ]
+    findTop "onType" [ ont arg o | ont <- onType (getSchemaSetting arg) ]
 
 isType :: J.Object -> Text -> Bool
 isType o tCheck = isJust $
@@ -405,15 +404,13 @@ doOnModule arg scFile =
   do
     iom <- snd <$> ask
     prev <- Map.lookup scFile <$> liftIO (readIORef iom)
-    maybe newRegister return prev
+    mkName . T.unpack <$> maybe newRegister return prev
   where
-    stg = getSchemaSetting arg
     newRegister =
       do
-        (ms, o) <- readModuleFile stg arg scFile
-        nm <- typeNameOfModule stg arg ms
-        either id id $
-            findTop "onModule" [ onm arg ms o | onm <- onModule (getSchemaSetting arg) ]
+        (ms, o) <- callSchemaSetting readModuleFile arg scFile
+        nm <- callSchemaSetting typeNameOfModule arg ms
+        findTop "onModule" [ onm arg ms o | onm <- onModule (getSchemaSetting arg) ]
         iom <- snd <$> ask
         liftIO $ modifyIORef' iom $ Map.insert scFile nm
         return nm
