@@ -210,14 +210,10 @@ onModule_object arg ms o =
     return $
       do
         nm <- mkName . T.unpack <$> callSchemaSetting typeNameOfModule arg ms
-        fields <- makeFields props
+        fields <- doOnMemberList arg ms (HM.toList props)
         myO <- liftQ $ newName "o"
         putDec $ makeDataDec nm fields
         putDec $ makeFromJSONDec nm myO fields
-  where
-    makeFields = mapM doMember' . HM.toList
-    doMember' (k, J.Object oMem) = doOnMember arg ms k oMem
-    doMember' (k, _) = fail $ "onModule_object: illegal member definition for " ++ T.unpack k
 
 makeDataDec :: HasFieldInfoBasic field => Name -> [field] -> Dec
 makeDataDec nm fields = DataD [] nm [] Nothing [RecC nm conFields] [deriveClause]
@@ -331,6 +327,14 @@ doOnMember ::
 doOnMember arg ms n o =
     findTop "onMember"
         [ onm arg ms n o | onm <- onMember (getSchemaSetting arg) ]
+
+doOnMemberList ::
+    (HasSchemaSetting a, Traversable t) =>
+    a -> RelatedModuleSummary a -> t (MemberName, JSONValue) -> SCQ (t (RelatedFieldInfo a))
+doOnMemberList arg ms = mapM doMember'
+  where
+    doMember' (k, J.Object o) = doOnMember arg ms k o
+    doMember' (k, _) = fail $ "onModule_object: illegal member definition for " ++ T.unpack k
 
 doOnType :: HasSchemaSetting a => a -> J.Object -> SCQ Type
 doOnType arg o =
