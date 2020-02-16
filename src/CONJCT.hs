@@ -64,17 +64,31 @@ type MemberName = Text
 type TypeName = Text
 type IsRequired = Bool
 
-data FieldInfo = FieldInfo {
+data FieldInfoBasic = FieldInfoBasic {
     fldJSONName :: Text,
     fldHsName :: Name,
-    fldType :: Type,
-    fldFromJSON :: Name -> Exp,
+    fldType :: Type
+  }
+
+data FieldInfoFromJSON = FieldInfoFromJSON {
+    fldFromJSON :: Name -> Exp
+  }
+
+data FieldInfoToJSON = FieldInfoToJSON {
     fldToJSON :: Name -> Exp
+  }
+
+data DefaultFieldInfo = DefaultFieldInfo {
+    dfinfoBasic :: FieldInfoBasic,
+    dfinfoFromJSON :: FieldInfoFromJSON,
+    dfinfoToJSON :: FieldInfoToJSON
   }
 
 type OnType a = a -> J.Object -> Maybe (SCQ Type)
 type OnModule a = a -> RelatedModuleSummary a -> J.Object -> Maybe (SCQ ())
-type OnMember a = a -> RelatedModuleSummary a -> MemberName -> J.Object -> Maybe (SCQ FieldInfo)
+type OnMember a = a -> RelatedModuleSummary a -> MemberName -> J.Object -> Maybe (SCQ (RelatedFieldInfo a))
+type OnMemberForDefaultFieldInfo a =
+    a -> RelatedModuleSummary a -> MemberName -> J.Object -> Maybe (SCQ DefaultFieldInfo)
 
 data SchemaSetting a = SchemaSetting {
     readModuleFile :: a -> Text -> SCQ (RelatedModuleSummary a, J.Object),
@@ -95,6 +109,8 @@ class HasSchemaSetting a
     getSchemaSetting :: a -> SchemaSetting a
     type RelatedModuleSummary a :: *
     type RelatedModuleSummary a = ModuleSummary
+    type RelatedFieldInfo a :: *
+    type RelatedFieldInfo a = DefaultFieldInfo
 
 callSchemaSetting :: HasSchemaSetting a => (SchemaSetting a -> a -> b) -> a -> b
 callSchemaSetting f arg = f (getSchemaSetting arg) arg
@@ -112,6 +128,31 @@ instance HasSchemaSetting SimpleSchemaSetting
 instance HasModuleSummary ModuleSummary
   where
     getModuleSummary = id
+
+class HasFieldInfoBasic a
+  where
+    getFieldInfoBasic :: a -> FieldInfoBasic
+
+class HasFieldInfoFromJSON a
+  where
+    getFieldInfoFromJSON :: a -> FieldInfoFromJSON
+
+class HasFieldInfoToJSON a
+  where
+    getFieldInfoToJSON :: a -> FieldInfoToJSON
+
+instance HasFieldInfoBasic DefaultFieldInfo
+  where
+    getFieldInfoBasic = dfinfoBasic
+
+instance HasFieldInfoFromJSON DefaultFieldInfo
+  where
+    getFieldInfoFromJSON = dfinfoFromJSON
+
+instance HasFieldInfoToJSON DefaultFieldInfo
+  where
+    getFieldInfoToJSON = dfinfoToJSON
+
 
 schemaSuffix :: Text
 schemaSuffix = ".schema.json"
@@ -157,7 +198,11 @@ memberNameDefault ms k = maybe (fail errMsg) return $
     ModuleSummary{..} = getModuleSummary ms
     errMsg = "memberNameDefault: Could not generate a name for " ++ T.unpack k
 
-onModule_object :: HasSchemaSetting a => OnModule a
+onModule_object ::
+    (   HasSchemaSetting a,
+        HasFieldInfoBasic (RelatedFieldInfo a),
+        HasFieldInfoFromJSON (RelatedFieldInfo a)) =>
+    OnModule a
 onModule_object arg ms o =
   do
     guard $ o `isType` "object"
@@ -166,39 +211,43 @@ onModule_object arg ms o =
       do
         nm <- mkName . T.unpack <$> callSchemaSetting typeNameOfModule arg ms
         fields <- makeFields props
-        let conFields = (\FieldInfo{..} -> (fldHsName, fieldBang, fldType)) <$> fields
-        putDec $
-            DataD [] nm [] Nothing [RecC nm conFields] [deriveClause]
-        
         myO <- liftQ $ newName "o"
-        putDec $
-            InstanceD Nothing [] (AppT (ConT ''J.FromJSON) (ConT nm)) [
-                FunD 'J.parseJSON [
-                    Clause [] (NormalB $
-                        VarE 'J.withObject `AppE` (LitE $ StringL $ nameBase nm) `AppE`
-                            LamE [VarP myO] (
-                                foldl
-                                    (\x y -> VarE '(<*>) `AppE` x `AppE` y)
-                                    (VarE 'pure `AppE` ConE nm)
-                                    (($ myO) . fldFromJSON <$> fields)
-                              )
-                      )
-                        []
-                  ]
-              ]
+        putDec $ makeDataDec nm fields
+        putDec $ makeFromJSONDec nm myO fields
   where
     makeFields = mapM doMember' . HM.toList
     doMember' (k, J.Object oMem) = doOnMember arg ms k oMem
     doMember' (k, _) = fail $ "onModule_object: illegal member definition for " ++ T.unpack k
 
+makeDataDec :: HasFieldInfoBasic field => Name -> [field] -> Dec
+makeDataDec nm fields = DataD [] nm [] Nothing [RecC nm conFields] [deriveClause]
+  where
+    conFields = toConFields . getFieldInfoBasic <$> fields
+    toConFields FieldInfoBasic{..} = (fldHsName, fieldBang, fldType)
     fieldBang = Bang NoSourceUnpackedness SourceStrict
-
     deriveClause = DerivClause Nothing [
         ConT ''Eq,
         ConT ''Show,
         ConT ''Generic
       ]
 
+makeFromJSONDec :: HasFieldInfoFromJSON field => Name -> Name -> [field] -> Dec
+makeFromJSONDec nm myO fields =
+    InstanceD
+        Nothing
+        []
+        (ConT ''J.FromJSON `AppT` ConT nm)
+        [FunD 'J.parseJSON [ Clause [] (NormalB definition) []]]
+  where
+    definition =
+        VarE 'J.withObject `AppE` (LitE $ StringL $ nameBase nm) `AppE`
+            LamE [VarP myO] (
+                foldl
+                    (\x y -> VarE '(<*>) `AppE` x `AppE` y)
+                    (VarE 'pure `AppE` ConE nm)
+                    [ fj myO | fj <- fldFromJSON . getFieldInfoFromJSON <$> fields]
+              )
+    
 onModule_knownType :: HasSchemaSetting a => OnModule a
 onModule_knownType arg ms o = Just $
   do
@@ -227,17 +276,20 @@ findTop s l = case catMaybes l
     [] -> fail $ "No appropreate handler: " <> T.unpack s
     x:_ -> x
 
-mkFieldInfo :: MemberName -> Type -> Text -> Name -> FieldInfo
-mkFieldInfo hsName fldType fldJSONName op = FieldInfo {..}
+mkFieldInfo :: MemberName -> Type -> Text -> Name -> DefaultFieldInfo
+mkFieldInfo hsName fldType fldJSONName op = DefaultFieldInfo {..}
   where
     fldHsName = mkName $ T.unpack hsName
     fldFromJSON = \vn -> VarE op `AppE` VarE vn `AppE` LitE (StringL $ T.unpack fldJSONName)
     fldToJSON = undefined
+    dfinfoBasic = FieldInfoBasic {..}
+    dfinfoFromJSON = FieldInfoFromJSON {..}
+    dfinfoToJSON = FieldInfoToJSON {..}
 
 -- | For non-zero array members, omited value can be represented by empty array
 onMember_nonzeroArray ::
     (HasSchemaSetting a, HasModuleSummary (RelatedModuleSummary a)) =>
-    OnMember a
+    OnMemberForDefaultFieldInfo a
 onMember_nonzeroArray arg ms k o =
   do
     guard $ not (isRequired ms k)
@@ -253,7 +305,7 @@ onMember_nonzeroArray arg ms k o =
 
 onMember_opt ::
     (HasSchemaSetting a, HasModuleSummary (RelatedModuleSummary a)) =>
-    OnMember a
+    OnMemberForDefaultFieldInfo a
 onMember_opt arg ms k o =
   do
     guard $ not (isRequired ms k)
@@ -266,14 +318,16 @@ onMember_opt arg ms k o =
     
 onMember_default ::
     (HasSchemaSetting a, HasModuleSummary (RelatedModuleSummary a)) =>
-    OnMember a
+    OnMemberForDefaultFieldInfo a
 onMember_default arg ms k o = Just $
   do
     t <- doOnType arg o
     nMem <- callSchemaSetting memberName arg ms k
     return $ mkFieldInfo nMem t k '(J..:)
 
-doOnMember :: HasSchemaSetting a => a -> RelatedModuleSummary a -> MemberName -> J.Object -> SCQ FieldInfo
+doOnMember ::
+    HasSchemaSetting a =>
+    a -> RelatedModuleSummary a -> MemberName -> J.Object -> SCQ (RelatedFieldInfo a)
 doOnMember arg ms n o =
     findTop "onMember"
         [ onm arg ms n o | onm <- onMember (getSchemaSetting arg) ]
@@ -349,7 +403,7 @@ onType_fallback _ _ = Just $ return (ConT ''JSONValue)
     
 
 defaultSchemaSetting ::
-    (HasSchemaSetting a, RelatedModuleSummary a ~ ModuleSummary) =>
+    (HasSchemaSetting a, RelatedModuleSummary a ~ ModuleSummary, RelatedFieldInfo a ~ DefaultFieldInfo) =>
     Text -> SchemaSetting a
 defaultSchemaSetting path = SchemaSetting {
     readModuleFile = readModuleFileDefault path,
@@ -374,7 +428,8 @@ onTypeDefaultList = [
   ]
 
 onModuleDefaultList ::
-    (HasSchemaSetting a, HasModuleSummary (RelatedModuleSummary a)) =>
+    (HasSchemaSetting a, HasModuleSummary (RelatedModuleSummary a),
+        HasFieldInfoBasic (RelatedFieldInfo a), HasFieldInfoFromJSON (RelatedFieldInfo a)) =>
     [OnModule a]
 onModuleDefaultList = [
     onModule_object,
@@ -383,7 +438,7 @@ onModuleDefaultList = [
 
 onMemberDefaultList ::
     (HasSchemaSetting a, HasModuleSummary (RelatedModuleSummary a)) =>
-    [OnMember a]
+    [OnMemberForDefaultFieldInfo a]
 onMemberDefaultList = [
     onMember_nonzeroArray,
     onMember_opt,
