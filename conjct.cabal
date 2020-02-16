@@ -16,7 +16,7 @@ category:            Data
 extra-source-files:  CHANGELOG.md
 
 library
-  exposed-modules:     CONJCT, CONJCT.Util
+  exposed-modules:     CONJCT, CONJCT.Util, CONJCT.Preset.V1
   -- other-modules:
   -- other-extensions:
   ghc-options:         -Wall
