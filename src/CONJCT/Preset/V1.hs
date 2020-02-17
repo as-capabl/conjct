@@ -179,51 +179,19 @@ onType_allOf arg o =
 
 onType_fallback :: OnType a
 onType_fallback _ _ = Just $ return (ConT ''JSONValue)
-    
 
-schemaSuffix :: Text
-schemaSuffix = ".schema.json"
-
-schemaSuffixLen :: Int
-schemaSuffixLen = T.length schemaSuffix
-
-unSuffix :: Text -> Maybe Text
-unSuffix fileName = 
-  do  
-    let lTotal = T.length fileName
-        lName = lTotal - schemaSuffixLen
-    guard $ lName > 0
-    let (nm, sfx) = T.splitAt lName fileName
-    guard $ sfx == schemaSuffix
-    return nm
-
-tokenize :: Text -> [Text]
-tokenize = T.splitOn "."
-
-appToHead :: (Text -> Text) -> Text -> Text
-appToHead f s = let (nmHead, nmTail) = T.splitAt 1 s in f nmHead <> nmTail
 
 typeNameDefault :: HasModuleSummary ms => ms -> SCQ TypeName
 typeNameDefault ms =
   do
-    let ModuleSummary {..} = getModuleSummary ms
-    maybe (fail $ "typeNameDefault: Could not generate a name for " ++ T.unpack msSchemaFile) return $
-      do
-        nm <- tokenize <$> unSuffix msSchemaFile
-        return $ mconcat (appToHead T.toUpper <$> nm)
+    let f = msSchemaFile . getModuleSummary $ ms
+    return $ bigCamel (wordsIdent f)
 
 memberNameDefault :: (MonadFail m, HasModuleSummary ms) => ms -> Text -> m MemberName
-memberNameDefault ms k = maybe (fail errMsg) return $
+memberNameDefault ms mem = 
   do
-    sTy <- tokenize <$> unSuffix msSchemaFile
-    let sMem = tokenize k
-    case sTy ++ sMem
-      of
-        [] -> Nothing
-        x:xs -> return $ mconcat (appToHead T.toLower x : (appToHead T.toUpper <$> xs))
-  where
-    ModuleSummary{..} = getModuleSummary ms
-    errMsg = "memberNameDefault: Could not generate a name for " ++ T.unpack k
+    let f = msSchemaFile . getModuleSummary $ ms
+    return $ smallCamel (wordsIdent f ++ wordsIdent mem)
 
 readModuleFileDefault :: Text -> a -> Text -> SCQ (ModuleSummary, J.Object)
 readModuleFileDefault scBaseDir _ scFile =

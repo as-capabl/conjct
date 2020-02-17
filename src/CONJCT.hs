@@ -210,11 +210,11 @@ doOnModule arg scFile =
         liftIO $ modifyIORef' iom $ Map.insert scFile nm
         return nm
 
-fromSchema :: HasSchemaSetting a => a -> Text -> DecsQ
-fromSchema stg scFile =
+fromSchema :: HasSchemaSetting a => a -> [Text] -> DecsQ
+fromSchema stg files =
   do
     d <- liftIO $ newIORef $ Endo id
     m <- liftIO $ newIORef Map.empty
-    _ <- runReaderT (doOnModule stg scFile) (d, m)
+    forM_ files $ \file -> runReaderT (doOnModule stg file) (d, m)
     dEndo <- liftIO $ readIORef d
     return $ appEndo dEndo []
